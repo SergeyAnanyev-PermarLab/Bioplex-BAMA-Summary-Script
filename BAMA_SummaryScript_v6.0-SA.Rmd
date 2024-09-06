@@ -86,7 +86,10 @@ if(!require(fuzzyjoin)){
   install.packages("fuzzyjoin",dependencies = T)
   library(fuzzyjoin)
 }
-
+if(!require(stringr)){
+  install.packages("stringr",dependencies = T)
+  library(stringr)
+}
 ### End of Session Prep ###
 
 
@@ -176,7 +179,7 @@ for (i in 1:length(qc.raw.files.assays)){
 
 # specify empty dataframes
 qcpassfail <- setNames(data.frame(matrix(ncol = 4, nrow=0)), 
-                       c("assay", "sampling_error", "blank_well_under_125"))
+                       c("assay", "sampling_error", "blank_well_over_400"))
 
 ## for loop to check the overall metrics in all of the assays
 
@@ -194,8 +197,8 @@ for (i in (1:nrow(qc.raw.files))){
     assayqc <- append(assayqc, "PASS")
   }
   
-  if (!is.na(as.numeric(QCtest[(nrow(QCtest) - 1), 3])) && as.numeric(QCtest[(nrow(QCtest) - 1), 3]) > 125 | 
-    !is.na(as.numeric(QCtest[nrow(QCtest), 3])) && as.numeric(QCtest[nrow(QCtest), 3]) > 125) {
+  if (!is.na(as.numeric(QCtest[(nrow(QCtest) - 1), 3])) && as.numeric(QCtest[(nrow(QCtest) - 1), 3]) > 400 | 
+    !is.na(as.numeric(QCtest[nrow(QCtest), 3])) && as.numeric(QCtest[nrow(QCtest), 3]) > 400) {
     assayqc <- append(assayqc, "FAIL")
   } else {
     assayqc <- append(assayqc, "PASS")
@@ -203,11 +206,11 @@ for (i in (1:nrow(qc.raw.files))){
     
   # bind the assay and pass/fail list to the overall dataframe
   qcpassfail <- rbind(qcpassfail, as.data.frame(assayqc, 
-                                                col.names = c("assay", "sampling_error", "blank_well_under_125")))
+                                                col.names = c("assay", "sampling_error", "blank_well_over_400")))
 }
 
 # Step 3: Remove the assays that fail and put them into a separate dataframe
-assaysPassedQC <- subset(qcpassfail, qcpassfail$sampling_error == "PASS" & qcpassfail$blank_well_under_125 == "PASS") 
+assaysPassedQC <- subset(qcpassfail, qcpassfail$sampling_error == "PASS" & qcpassfail$blank_well_over_400 == "PASS") 
 
 # put assays that fail into a separate dataframe
 assaysFailedQC <- anti_join(qcpassfail, assaysPassedQC)
@@ -1425,47 +1428,79 @@ write.csv(SummaryFile, paste0(workingDirectory, folderOutput, projectName, "_sum
 # Assemble Stats Summary
 
 ```{r}
-StatsSummaryGenerator <- function(QClist) {
+
+InputGeneratorForStatsFrame <- function(FailQClist, PassedQClist) {
+  # Remove frames with ncol = 0
+  FailQClist <- lapply(FailQClist, function(df) if (ncol(df) > 0) df else NULL)
+  FailQClist <- Filter(Negate(is.null), FailQClist)
   
-  # Find the union of column names
-  all_columns <- unique(c(names(QClist[[1]]), names(QClist[[2]])))
+  # Rename the first column to "Assay_Date"
+  FailQClist <- lapply(FailQClist, function(df) {
+    colnames(df)[1] <- "Assay_Date"
+    df
+  })
   
-  # Add missing columns with NA values and reorder columns
-  for (i in 1:2) {
-    missing_cols <- setdiff(all_columns, names(QClist[[i]]))
-    QClist[[i]][missing_cols] <- NA
-    QClist[[i]] <- QClist[[i]][, all_columns]
+  # Rename the second column to "Raw_Path"
+  FailQClist <- lapply(FailQClist, function(df) {
+    if (ncol(df) > 1) {
+      colnames(df)[2] <- "Raw_Path"
+    }
+    df
+  })
+  
+  # Move "sampledescription" column to the first position
+  FailQClist <- lapply(FailQClist, function(df) {
+    if ("sampledescription" %in% colnames(df)) {
+      df <- df[, c("sampledescription", setdiff(colnames(df), "sampledescription"))]
+    }
+    df
+  })
+  
+  # Rename the second column in PassedQClist to "Assay_Date"
+  PassedQClist <- lapply(PassedQClist, function(df) {
+    if (ncol(df) > 1) {
+      colnames(df)[2] <- "Assay_Date"
+    }
+    df
+  })
+
+  # Rename the third column in PassedQClist to "Raw_Path"
+  PassedQClist <- lapply(PassedQClist, function(df) {
+    if (ncol(df) > 2) {
+      colnames(df)[3] <- "Raw_Path"
+    }
+    df
+  })
+  
+  # Bind FailQClist frames into one dataframe
+  if (length(FailQClist) > 1) {
+    FailQClist <- bind_rows(FailQClist)
+  } else {
+    FailQClist <- FailQClist[[1]]
   }
+
+  # Bind PassedQClist frames into one dataframe
+  if (length(PassedQClist) > 1) {
+    PassedQClist <- bind_rows(PassedQClist)
+  } else {
+    PassedQClist <- PassedQClist[[1]]
+  }
+
+  colnames(PassedQClist)[4:ncol(PassedQClist)] <- paste0(colnames(PassedQClist)[4:ncol(PassedQClist)], " MFI")
   
-  # Row bind the data frames
-  statsFrame <- do.call(rbind, QClist)
+  # Bind FailQClist and PassedQClist together
+  final_df <- bind_rows(FailQClist, PassedQClist)
   
-  # Remove rows with all NA values
-  statsFrame <- statsFrame[rowSums(is.na(statsFrame)) != ncol(statsFrame), ]
+  StatsInput <<- final_df
+}
+
+InputGeneratorForStatsFrame(FailQClist, PassedQClist)
+
+
+
+StatsSummaryGenerator <- function(QClist,isotype,panel) {
   
-  # Convert all columns ending with "MFI" and "CV" to double
-  statsFrame <- statsFrame %>%
-    mutate(across(ends_with("MFI"), as.double))
-  
-  statsFrame <- statsFrame %>%
-    mutate(across(ends_with("CV"), as.double))
-  
-  
-  # Create the stats_assembly dataframe with the specified columns
-  stats_assembly <- data.frame(
-    Sample_ID = character(),
-    Antigen = character(),
-    Isotype = character(),
-    Panel = character(),
-    Sample_Dilution = numeric(),
-    MFI = numeric(),
-    CV = numeric(),
-    Pass_Fail = character(),
-    Reason = character(),
-    Assay_Date = as.Date(character()),
-    Raw_Path = character(),
-    stringsAsFactors = FALSE
-  )
+  statsFrame <- QClist
   
     # Pivot longer for MFI columns
   mfi_long <- statsFrame %>%
@@ -1481,26 +1516,48 @@ StatsSummaryGenerator <- function(QClist) {
                  values_to = "CV" 
     )
   
-  browser()
-  
-  # Combine the two pivoted data frames
-  stats_assembly <- left_join(mfi_long, cv_long)
-  
+  # Keep only the specified columns
+  cols_to_keep_mfi <- c("sampledescription", "Assay_Date", "Raw_Path", "Reason", "Failed_Beads", "Antigen", "MFI")
   
   # Keep only the specified columns
-  cols_to_keep <- c("sampledescription", "assayfile", "Reason", "Antigen", "MFI", "CV")
-  stats_assembly <- stats_assembly[, cols_to_keep, drop = FALSE]
+  cols_to_keep_cv <- c("sampledescription", "Assay_Date", "Raw_Path", "Reason", "Failed_Beads", "Antigen", "CV")
+  
+  mfi_long <- mfi_long[, cols_to_keep_mfi, drop = FALSE]
+  
+  cv_long <- cv_long[, cols_to_keep_cv, drop = FALSE]
+  
+  # Combine the two data frames by columns
+  stats_assembly <- cbind(mfi_long, cv_long$CV)
+
+  # Optionally, rename the new column if needed
+  colnames(stats_assembly)[ncol(stats_assembly)] <- "CV"
   
   # Remove empty rows
   stats_assembly <- stats_assembly[!(is.na(stats_assembly$MFI) & is.na(stats_assembly$CV)), ]
   
-  # Create Pass_Fail column
-  stats_assembly$Pass_Fail <- ifelse(is.na(stats_assembly$Reason), "Pass", "Fail")
+  # Remove " MFI" or " CV" from the end of the values in the Antigen column
+  stats_assembly <- stats_assembly %>%
+    mutate(Antigen = gsub(" MFI$| CV$", "", Antigen))
+
+  # Create Pass_Fail column based on Failed_Beads and Antigen columns
+  stats_assembly <- stats_assembly %>%
+  mutate(Pass_Fail = ifelse(sapply(1:nrow(stats_assembly), function(i) {
+    str_detect(stats_assembly$Failed_Beads[i], fixed(stats_assembly$Antigen[i]))
+  }), "Fail", "Pass")) %>%
+  mutate(Pass_Fail = ifelse(is.na(Reason), "Pass", Pass_Fail))
+  
+  
+  # Remove the Failed_Beads column
+  stats_assembly$Failed_Beads <- NULL
+  
+  # Set Reason column value to NA if Pass_Fail value is Pass
+  stats_assembly <- stats_assembly %>%
+    mutate(Reason = ifelse(Pass_Fail == "Pass", NA, Reason))
   
   # Function to extract Date and Sample_Dilution from assayfile
-  extract_info <- function(assayfile) {
+  extract_info <- function(Raw_Path) {
     # Extract substring after the last "/"
-    sub_str <- sub(".*\\/", "", assayfile)
+    sub_str <- sub(".*\\/", "", Raw_Path)
   
     # Extract Date
     date <- sub("_.*", "", sub_str)
@@ -1512,23 +1569,38 @@ StatsSummaryGenerator <- function(QClist) {
   }
 
   # Apply the function to each row
-  info <- t(apply(stats_assembly, 1, function(row) extract_info(row["assayfile"])))
+  info <- t(apply(stats_assembly, 1, function(row) extract_info(row["Raw_Path"])))
 
   # Add the new columns to the dataframe
-  stats_assembly$Date <- info[, 1]
   stats_assembly$Sample_Dilution <- info[, 2]
 
   # Create Isotype and Panel columns (assuming you have a way to determine these)
-  stats_assembly$Isotype <- NA  # Placeholder, update with actual logic
-  stats_assembly$Panel <- NA    # Placeholder, update with actual logic
+  stats_assembly$Isotype <- isotype  # Placeholder, update with actual logic
+  stats_assembly$Panel <- sapply(stats_assembly$Raw_Path, function(x) {
+    match <- str_extract(x, "CMV004-IgG-[^-]+-")
+    if (!is.na(match)) {
+      str_extract(match, "(?<=CMV004-IgG-)[^-]+")
+    } else {
+      NA
+    }
+  })
+  # Rename the column
+  stats_assembly <- stats_assembly %>%
+    rename(Sample_ID = sampledescription)
   
-  # Write the combined data frame to a CSV file
-  # write.csv(stats_assembly, "Stats_Summary.csv", row.names = FALSE)
+  # Reorder the columns
+  stats_assembly <- stats_assembly[, c("Sample_ID", "Antigen", "Isotype", "Panel", "Sample_Dilution", "MFI", "CV", "Pass_Fail", "Reason", "Assay_Date", "Raw_Path")]
+  
+  # Remove unneeded strings from Sample_Dilution
+  stats_assembly$Sample_Dilution <- gsub("-repeats|-reruns", "", stats_assembly$Sample_Dilution)
+  
+  # Write out the summary file
+  write.csv(stats_assembly, paste0(workingDirectory, folderOutput, projectName, "_Stats-Summary-file.csv"), row.names = FALSE)
   
   # Declare the combined data frame as a global variable
   assign("StatsFrame", stats_assembly, envir = .GlobalEnv)
 }
 
-StatsSummaryGenerator(QClist)
+StatsSummaryGenerator(StatsInput,isotype,panel)
 ```
 
